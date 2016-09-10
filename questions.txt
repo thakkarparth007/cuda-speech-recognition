@@ -1,0 +1,6 @@
+line 138 - should be secondLimit
+why loops in backProp* and learn*?
+why so small number of neurons? - cuda works better with larger numbers, right?
+what are the benchmarks (timings: gpu time, cpu time, copy time)?
+what was done in preprocessing? what's the positive/negative? why only 10 pairs?
+minor: predict on gpu? doesn't matter, right?
