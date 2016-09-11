@@ -1,19 +1,20 @@
 //Native Libraries
-#include<stdio.h>
-#include<stdlib.h>
-#include<string>
-#include<vector>
-#include<iostream>
-#include<time.h>
-#include<map>
-#include<limits>
-#include<fstream>
-#include<iomanip>
-#include<ctime>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <time.h>
+#include <map>
+#include <limits>
+#include <fstream>
+#include <iomanip>
+#include <ctime>
+#include <algorithm>
 
 //CUDA Libraries
-#include<cuda.h>
-#include<math_functions.h>
+#include <cuda.h>
+#include <math_functions.h>
 
 //Size Macros
 #define inputLimit 10
@@ -24,34 +25,53 @@
 //Error Checking
 #define checkError(ans) {gpuAssert((ans),__FILE__,__LINE__);}
 
+__device__ inline void atomicadd(float* address, float value){
+#if __CUDA_ARCH__ >= 200 // for Fermi, atomicAdd supports floats
+  atomicAdd(address,value);
+#elif __CUDA_ARCH__ >= 110
+// float-atomic-add from 
+// [url="http://forums.nvidia.com/index.php?showtopic=158039&view=findpost&p=991561"]http://forums.nvidia.com/index.php?showtop...st&p=991561[/url]
+  float old = value;
+  while ((old = atomicExch(address, atomicExch(address, 0.0f)+old))!=0.0f);
+#endif
+}
+
 using namespace std;
 
 //Global Variables
 int maxIterations=50000;
-__constant__ double bias=0.0;
-__constant__ double learningRate=0.5;
-double minValue=0.0;
-double maxValue=5000.0;
-double integer_maximum=(double)numeric_limits<int>::max();
-double integer_minimum=(double)numeric_limits<int>::min();
-int inputCS=inputLimit*secondLimit*sizeof(double),inputLS=inputLimit*sizeof(double);
-int secondCS=thirdLimit*secondLimit*sizeof(double),secondLS=secondLimit*sizeof(double);
-int thirdCS=thirdLimit*fourthLimit*sizeof(double),thirdLS=thirdLimit*sizeof(double);
-int fourthLS=fourthLimit*sizeof(double);
-double *inputLayerD,*secondLayerD,*thirdLayerD,*fourthLayerD;
-double *inputConnectionD;
-double *secondConnectionD;
-double *thirdConnectionD;
-double inputLayer[inputLimit];
-double secondLayer[secondLimit];
-double thirdLayer[thirdLimit];
-double fourthLayer[fourthLimit];
+__constant__ float bias=0.0;
+__constant__ float learningRate=0.1;
+float minValue=0.0;
+float maxValue=5000.0;
+float integer_maximum=(float)numeric_limits<int>::max();
+float integer_minimum=(float)numeric_limits<int>::min();
+int inputCS=inputLimit*secondLimit*sizeof(float),inputLS=inputLimit*sizeof(float);
+int secondCS=thirdLimit*secondLimit*sizeof(float),secondLS=secondLimit*sizeof(float);
+int thirdCS=thirdLimit*fourthLimit*sizeof(float),thirdLS=thirdLimit*sizeof(float);
+int fourthLS=fourthLimit*sizeof(float);
+float *aInputLayerD,*aSecondLayerD,*aThirdLayerD,*aFourthLayerD;
+float *zSecondLayerD,*zThirdLayerD,*zFourthLayerD;
+float *inputConnectionD, *secondConnectionD, *thirdConnectionD;
+float *delta4D, *delta3D, *delta2D, *errD;
+
+// store the activations (a values) of the following layers
+float aInputLayer[inputLimit];
+float aSecondLayer[secondLimit];
+float aThirdLayer[thirdLimit];
+float aFourthLayer[fourthLimit];
+
+// store the combined inputs (z values) of the following layers
+float zSecondLayer[secondLimit];
+float zThirdLayer[thirdLimit];
+float zFourthLayer[fourthLimit];
+
 map<string,int> phonemeIDMapping;
-double inputConnection[secondLimit*inputLimit];
-double secondConnection[thirdLimit*secondLimit];
-double thirdConnection[fourthLimit*thirdLimit];
+float inputConnection[secondLimit*inputLimit];
+float secondConnection[thirdLimit*secondLimit];
+float thirdConnection[fourthLimit*thirdLimit];
 string phonemes[41];
-double timeTaken=0;
+float timeTaken=0;
 
 inline void gpuAssert(cudaError_t code,const char *file,int line,bool abort=true)
 {
@@ -110,15 +130,16 @@ void initLearningData()
 		phonemeIDMapping[phonemes[i]]=(i+1);
 	}
 }
-double getRandomWeight()
+float getRandomWeight()
 {
-	double val=(double)rand();
-	val=(val-integer_minimum)/(integer_maximum-integer_minimum);
-	return val;
+//	float val=(float)rand();
+//	val=(val-integer_minimum)/(integer_maximum-integer_minimum);
+//	return val;
+	return (rand() - RAND_MAX/2.0) / (RAND_MAX * 1.0);
 }
-double normalize(double value)
+float normalize(float value)
 {
-	double val=(value-minValue)/(maxValue-minValue);
+	float val=(value-minValue)/(maxValue-minValue);
 	return val;
 }
 void init()
@@ -153,113 +174,140 @@ void init()
 	checkError(cudaMemcpy(secondConnectionD,secondConnection,secondCS,cudaMemcpyHostToDevice));
 	checkError(cudaMalloc((void**)&thirdConnectionD,thirdCS));
 	checkError(cudaMemcpy(thirdConnectionD,thirdConnection,thirdCS,cudaMemcpyHostToDevice));
-	checkError(cudaMalloc((void**)&inputLayerD,inputLS));
-	checkError(cudaMemcpy(inputLayerD,inputLayer,inputLS,cudaMemcpyHostToDevice));
-	checkError(cudaMalloc((void**)&secondLayerD,secondLS));
-	checkError(cudaMemcpy(secondLayerD,secondLayer,secondLS,cudaMemcpyHostToDevice));
-	checkError(cudaMalloc((void**)&thirdLayerD,thirdLS));
-	checkError(cudaMemcpy(thirdLayerD,thirdLayer,thirdLS,cudaMemcpyHostToDevice));
-	checkError(cudaMalloc((void**)&fourthLayerD,fourthLS));
-	checkError(cudaMemcpy(fourthLayerD,fourthLayer,fourthLS,cudaMemcpyHostToDevice));
+
+	checkError(cudaMalloc((void**)&aInputLayerD,inputLS));
+	checkError(cudaMalloc((void**)&aSecondLayerD,secondLS));
+	checkError(cudaMalloc((void**)&aThirdLayerD,thirdLS));
+	checkError(cudaMalloc((void**)&aFourthLayerD,fourthLS));
+
+	checkError(cudaMalloc((void**)&zSecondLayerD,secondLS));
+	checkError(cudaMalloc((void**)&zThirdLayerD,thirdLS));
+	checkError(cudaMalloc((void**)&zFourthLayerD,fourthLS));
+
+	checkError(cudaMalloc((void**)&errD,fourthLS));
+	checkError(cudaMalloc((void**)&delta4D,fourthLS));
+	checkError(cudaMalloc((void**)&delta3D,thirdLS));
+	checkError(cudaMalloc((void**)&delta2D,secondLS));
 }
-__device__ double sigmoid(double value)
+__device__ float sigmoid(float value)
 {
-	double val=1/(1+exp(-value));
+	float val=1/(1+exp(-value));
 	return val;
 }
-__device__ double activation(double value,int derivative)
+__device__ float activation(float value,int derivative)
 {
-	double val=derivative==1?value*(1-value):sigmoid(value);
+	float val=sigmoid(value);
+	val *= derivative==1? (1-val): 1;
 	if(isnan(val))
 	{
 		val=0.0;
 	}
 	return val;
 }
-__global__ void backPropagate4to3(double *err,double *thirdC,double *fourth,double *third,double *delta)
+__global__ void calculateError(float *aFourth, float *err, int expectedOutput)
 {
-	int i = blockIdx.x;
-	int j = blockIdx.y;
-	int index = i*thirdLimit + j;
-	double correction=(err[i]*activation(fourth[i],1)*third[j]);
+	int i = threadIdx.x;
+	err[i] = aFourth[i] - (i + 1 == expectedOutput);
+}
+__global__ void backPropagate4to3(float *thirdC,float *zFourth,float *aThird,float *err,float *delta4)
+{
+	//__shared__ float deltas[thirdLimit];
+	int i=threadIdx.x;
+	int j=threadIdx.y;
+
+	int index=i*thirdLimit+j;
+	delta4[i]=err[i]*activation(zFourth[i],1);
+	float correction=delta4[i]*aThird[j];
 	thirdC[index]=thirdC[index]-learningRate*correction;
-	delta[j]=delta[j]+(correction*thirdC[index]);
+	//if(i == j && i == 0)
+	//	printf("(%d,%d):err=%f,zFourth=%f,%f*%f=%f\t%f\n", i, j, err[i], zFourth[i], delta4[i], aThird[j], correction,thirdC[index]);
 }
-__global__ void backPropagate3to2(double *secondC,double *third,double *second,double *delta,double *delta1)
+__global__ void backPropagate3to2(float *thirdC, float *secondC,float *zThird,float *aSecond,float *delta4,float *delta3)
 {
-	int i=blockIdx.x;
-	int j = blockIdx.y;
+	int i=threadIdx.x;
+	int j=threadIdx.y;
 	int index=i*secondLimit+j;
-	double correction=(delta[i]*activation(third[i],1)*second[j]);
+
+	// calculate delta3 from delta4
+	float dotprod_ith_term = 0;
+	for(int k = 0; k < fourthLimit; k++) {
+		dotprod_ith_term += thirdC[k*thirdLimit+i] * delta4[k];
+	}
+
+	delta3[i] = dotprod_ith_term * activation(zThird[i], 1);
+	float correction=delta3[i]*aSecond[j];
 	secondC[index]=secondC[index]-learningRate*correction;
-	delta1[j]=delta1[j]+(correction*secondC[index]);
 }
-__global__ void backPropagate2to1(double *inputC,double *second,double *input,double *delta)
+__global__ void backPropagate2to1(float *secondC, float *inputC,float *zSecond,float *aInput,float *delta3,float *delta2)
 {
-	int i=blockIdx.x;
-	int j = blockIdx.y;
+	int i=threadIdx.x;
+	int j=threadIdx.y;
 	int index=i*inputLimit+j;
-	double correction=(delta[i]*activation(second[i],1)*input[j]);
+
+	// calculate delta2 from delta3
+	float dotprod_ith_term = 0;
+	for(int k = 0; k < thirdLimit; k++) {
+		dotprod_ith_term += secondC[k*secondLimit+i] * delta3[k];
+	}
+
+	delta2[i] = dotprod_ith_term * activation(zSecond[i], 1);
+	float correction=delta2[i]*aInput[j];
 	inputC[index]=inputC[index]-learningRate*correction;
 }
-void backPropagate(double *err)
+void backPropagate(int expectedOutput)
 {
-	double *deltaD,*delta1D,*errD;
-	checkError(cudaMalloc((void**)&errD,fourthLS));
-	checkError(cudaMemcpy(errD,err,fourthLS,cudaMemcpyHostToDevice));
-	checkError(cudaMalloc((void**)&deltaD,thirdLS));
-	checkError(cudaMalloc((void**)&delta1D,secondLS));
-	checkError(cudaMemset(deltaD,0,thirdLS));
-	checkError(cudaMemset(delta1D,0,secondLS));
 	time_t start=time(NULL);
 	
-	dim3 lim4to3(fourthLimit, thirdLimit);
-	dim3 lim3to2(thirdLimit, secondLimit);
-	dim3 lim2to1(secondLimit,inputLimit);
-	backPropagate4to3<<<lim4to3,1>>>(errD,thirdConnectionD,fourthLayerD,thirdLayerD,deltaD);
+	dim3 fourToThree(fourthLimit, thirdLimit);
+	dim3 threeToTwo(thirdLimit, secondLimit);
+	dim3 twoToOne(secondLimit, inputLimit);
+
+	calculateError<<<1, fourthLimit>>>(aFourthLayerD, errD, expectedOutput);
 	checkError(cudaThreadSynchronize());
-	backPropagate3to2<<<lim3to2,1>>>(secondConnectionD,thirdLayerD,secondLayerD,deltaD,delta1D);
+	backPropagate4to3<<<1, fourToThree>>>(thirdConnectionD,zFourthLayerD,aThirdLayerD,errD,delta4D);
 	checkError(cudaThreadSynchronize());
-	backPropagate2to1<<<lim2to1,1>>>(inputConnectionD,secondLayerD,inputLayerD,delta1D);
+	backPropagate3to2<<<1, threeToTwo>>>(thirdConnectionD,secondConnectionD,zThirdLayerD,aSecondLayerD,delta4D,delta3D);
+	checkError(cudaThreadSynchronize());
+	backPropagate2to1<<<1, twoToOne>>>(secondConnectionD,inputConnectionD,zSecondLayerD,aInputLayerD,delta3D,delta2D);
 	checkError(cudaThreadSynchronize());
 	time_t end=time(NULL);
 	timeTaken+=abs(difftime(start,end));
-	cudaFree(errD);
-	cudaFree(deltaD);
-	cudaFree(delta1D);
 }
-__global__ void learn1to2(double *input,double *inputC,double *second)
+__global__ void learn1to2(float *aInput,float *inputC,float *aSecond, float *zSecond)
 {
-	int i=blockIdx.x;
-	double sum=0.0;
+	int i=threadIdx.x;
+	float sum=0.0;
 	for(int j=0;j<inputLimit;j++)
 	{
 		int index=i*inputLimit+j;
-		sum+=(input[j]*inputC[index]);
+		sum+=(aInput[j]*inputC[index]);
 	}
-	second[i]=activation(sum,0);
+	aSecond[i]=activation(sum,0);
+	zSecond[i] = sum;
 }
-__global__ void learn2to3(double *second,double *secondC,double *third)
+__global__ void learn2to3(float *aSecond,float *secondC,float *aThird, float *zThird)
 {
-	int i=blockIdx.x;
-	double sum=0.0;
+	int i=threadIdx.x;
+	float sum=0.0;
 	for(int j=0;j<secondLimit;j++)
 	{
 		int index=i*secondLimit+j;
-		sum+=(second[j]*secondC[index]);
+		sum+=(aSecond[j]*secondC[index]);
 	}
-	third[i]=activation(sum,0);
+	aThird[i]=activation(sum,0);
+	zThird[i] = sum;
 }
-__global__ void learn3to4(double *third,double *thirdC,double *fourth)
+__global__ void learn3to4(float *aThird,float *thirdC,float *aFourth, float *zFourth)
 {
-	int i=blockIdx.x;
-	double sum=0.0;
+	int i=threadIdx.x;
+	float sum=0.0;
 	for(int j=0;j<thirdLimit;j++)
 	{
 		int index=i*thirdLimit+j;
-		sum+=(third[j]*thirdC[index]);
+		sum+=(aThird[j]*thirdC[index]);
 	}
-	fourth[i]=activation(sum,0);
+	aFourth[i]=activation(sum,0);
+	zFourth[i] = sum;
 }
 void copyBackData()
 {
@@ -267,7 +315,7 @@ void copyBackData()
 	checkError(cudaMemcpy(secondConnection,secondConnectionD,secondCS,cudaMemcpyDeviceToHost));
 	checkError(cudaMemcpy(thirdConnection,thirdConnectionD,thirdCS,cudaMemcpyDeviceToHost));
 }
-void printArray(double *arr,int size)
+void printArray(float *arr,int size)
 {
 	cout<<"[ ";
 	for(int i=0;i<size;i++)
@@ -278,60 +326,92 @@ void printArray(double *arr,int size)
 }
 void learner()
 {
+	float preprocessedInputs[41][inputLimit];
+	int sampleOrder[41]; // stores the order in which SGD is to be performed
+						 // this array will be shuffled every iteration
+
+	for(int i=0;i<41;i++)
+	{
+		string filename="Sound/preprocess/preprocess_"+phonemes[i]+"_1";
+		ifstream file(filename.c_str());
+		string phoneme=phonemes[i];
+		int j=0;
+		while(j<inputLimit)
+		{
+			float positive,negative;
+			file>>positive>>negative;
+			float val=positive>negative?positive:-negative;
+			preprocessedInputs[i][j]=normalize(val);
+			j++;
+		}
+		file.close();
+		sampleOrder[i] = i;
+	}
+
 	for(int k=0;k<maxIterations;k++)
 	{
+		random_shuffle(sampleOrder, sampleOrder+41);
+
 		for(int i=0;i<41;i++)
 		{
-			string filename="Sound/preprocess/preprocess_"+phonemes[i]+"_1";
-			ifstream file(filename.c_str());
-			string phoneme=phonemes[i];
+			string phoneme=phonemes[sampleOrder[i]];
 			int expectedOutput=phonemeIDMapping[phoneme];
-			int j=0;
-			while(j<inputLimit)
+			/*
+			cout << "===============================================\n";
+			cout << "Phoneme: " << phoneme << "\n";
+			checkError(cudaMemcpy(thirdConnection,thirdConnectionD,inputCS,cudaMemcpyDeviceToHost));
+			for(int lol=0;lol<fourthLimit;lol++)
 			{
-				double positive,negative;
-				file>>positive>>negative;
-				double val=positive>negative?positive:-negative;
-				inputLayer[j]=normalize(val);
-				j++;
-			}
-			checkError(cudaMemcpy(inputLayerD,inputLayer,inputLS,cudaMemcpyHostToDevice));
+				for(int j=0;j<thirdLimit;j++)
+				{
+					int index=lol*thirdLimit+j;
+					cout << setprecision(2) << thirdConnection[index] << " ";//=getRandomWeight();
+				}
+				cout << "\n";
+			} 
+			cout << "==============================================\n";*/
+			
+			//memcpy(aInputLayer, preprocessedInputs[sampleOrder[i]], inputLS);
+			//checkError(cudaMemcpy(aInputLayerD,aInputLayer,inputLS,cudaMemcpyHostToDevice));
+			checkError(cudaMemcpy(aInputLayerD,preprocessedInputs[sampleOrder[i]],inputLS,cudaMemcpyHostToDevice));
 			time_t start=time(NULL);
-			learn1to2<<<secondLimit,1>>>(inputLayerD,inputConnectionD,secondLayerD);
-			learn2to3<<<thirdLimit,1>>>(secondLayerD,secondConnectionD,thirdLayerD);
-			learn3to4<<<fourthLimit,1>>>(thirdLayerD,thirdConnectionD,fourthLayerD);
+			learn1to2<<<1,secondLimit>>>(aInputLayerD, inputConnectionD, aSecondLayerD, zSecondLayerD);
+			learn2to3<<<1,thirdLimit>>>(aSecondLayerD, secondConnectionD, aThirdLayerD, zThirdLayerD);
+			learn3to4<<<1,fourthLimit>>>(aThirdLayerD, thirdConnectionD, aFourthLayerD, zFourthLayerD);
 			time_t end=time(NULL);
 			timeTaken+=abs(difftime(start,end));
-			checkError(cudaMemcpy(fourthLayer,fourthLayerD,fourthLS,cudaMemcpyDeviceToHost));
-			checkError(cudaMemcpy(thirdLayer,thirdLayerD,thirdLS,cudaMemcpyDeviceToHost));
-			checkError(cudaMemcpy(secondLayer,secondLayerD,secondLS,cudaMemcpyDeviceToHost));
-			checkError(cudaMemcpy(inputLayer,inputLayerD,inputLS,cudaMemcpyDeviceToHost));
-			double err[fourthLimit];
-			double error=0.0;
-			for(int m=0;m<fourthLimit;m++)
+		//  checkError(cudaMemcpy(aFourthLayer,aFourthLayerD,fourthLS,cudaMemcpyDeviceToHost));
+		//	checkError(cudaMemcpy(aThirdLayer,aThirdLayerD,thirdLS,cudaMemcpyDeviceToHost));
+		//	checkError(cudaMemcpy(aSecondLayer,aSecondLayerD,secondLS,cudaMemcpyDeviceToHost));
+		//	checkError(cudaMemcpy(aInputLayer,aInputLayerD,inputLS,cudaMemcpyDeviceToHost));
+		//	float err[fourthLimit];
+	//		float error=0.0;
+		//	for(int m=0;m<fourthLimit;m++)
+		//	{
+		//		err[m]=(m+1)==expectedOutput? aFourthLayer[m]-1:aFourthLayer[m];
+		//		float s=(m+1)==expectedOutput?0.99999:0.00001;
+		//		error+=(0.5*(s-fourthLayer[m])*(s-fourthLayer[m]));
+		//	}
+			if((k)%1000==0)
 			{
-				err[m]=(m+1)==expectedOutput?fourthLayer[m]-1/*0.99999*/:fourthLayer[m];//-0.00001;
-				//double s=(m+1)==expectedOutput?0.99999:0.00001;
-				//error+=(0.5*(s-fourthLayer[m])*(s-fourthLayer[m]));
-			}
-			if((k+1)%1000==0)
-			{
+				checkError(cudaMemcpy(aFourthLayer,aFourthLayerD,fourthLS,cudaMemcpyDeviceToHost));
 				cout<<"Error: Iteration "<<(k+1)<<" Phoneme "<<phoneme<<" [";
-				double avg_error=0.0;
+				float avg_error=0.0, cur_err = 0.0;
 				for(int m=0;m<fourthLimit;m++)
 				{
-					avg_error+=abs(err[m]);
-					cout<<setprecision(6)<<err[m]<<" ";
+					cur_err = (m+1)==expectedOutput? aFourthLayer[m]-1:aFourthLayer[m];
+					avg_error+=abs(cur_err);
+					cout<<setprecision(6)<<cur_err<<" ";
 				}
 				avg_error=avg_error/fourthLimit;
 				cout<<"]"<<endl<<setprecision(6)<<avg_error<<endl;
 			}
-			backPropagate(err);
-			cudaMemset(inputLayerD,0,inputLS);
-			cudaMemset(secondLayerD,0,secondLS);
-			cudaMemset(thirdLayerD,0,thirdLS);
-			cudaMemset(fourthLayerD,0,fourthLS);
-			file.close();
+			backPropagate(expectedOutput);
+		//	cudaMemset(aInputLayerD,0,inputLS);
+		//	cudaMemset(aSecondLayerD,0,secondLS);
+		//	cudaMemset(aThirdLayerD,0,thirdLS);
+		//	cudaMemset(aFourthLayerD,0,fourthLS);
+		//	file.close();
 		}
 	}
 	copyBackData();
@@ -370,14 +450,14 @@ void commitToFile()
 	}
 	outputFile.close();
 }
-double sigmoidPredict(double value)
+float sigmoidPredict(float value)
 {
-	double val=1/(1+exp(-value));
+	float val=1/(1+exp(-value));
 	return val;
 }
-double activationPredict(double value,int derivative)
+float activationPredict(float value,int derivative)
 {
-	double val=derivative==1?value*(1-value):sigmoidPredict(value);
+	float val=derivative==1?value*(1-value):sigmoidPredict(value);
 	if(isnan(val))
 	{
 		val=0.0;
@@ -386,60 +466,56 @@ double activationPredict(double value,int derivative)
 }
 void predict()
 {
-	cout << "No error till here (1)\n";
 	for(int i=0;i<secondLimit;i++)
 	{
-		double sum=0.0;
+		float sum=0.0;
 		for(int j=0;j<inputLimit;j++)
 		{
 			int index=i*inputLimit+j;
-			sum+=(inputLayer[j]*inputConnection[index]);
+			sum+=(aInputLayer[j]*inputConnection[index]);
 		}
-		secondLayer[i]=activationPredict(sum,0);
+		aSecondLayer[i]=activationPredict(sum,0);
+		zSecondLayer[i] = sum;
 	}
-	cout << "No error till here (2)\n";
 	for(int i=0;i<thirdLimit;i++)
 	{
-		double sum=0.0;
+		float sum=0.0;
 		for(int j=0;j<secondLimit;j++)
 		{
 			int index=i*secondLimit+j;
-			sum+=(secondLayer[j]*secondConnection[index]);
+			sum+=(aSecondLayer[j]*secondConnection[index]);
 		}
-		thirdLayer[i]=activationPredict(sum,0);
+		aThirdLayer[i]=activationPredict(sum,0);
+		zSecondLayer[i] = sum;
 	}
-	cout << "No error till here (3)\n";
 	for(int i=0;i<fourthLimit;i++)
 	{
-		double sum=0.0;
+		float sum=0.0;
 		for(int j=0;j<thirdLimit;j++)
 		{
 			int index=i*thirdLimit+j;
-			sum+=(thirdLayer[j]*thirdConnection[index]);
+			sum+=(aThirdLayer[j]*thirdConnection[index]);
 		}
-		fourthLayer[i]=activationPredict(sum,0);
+		aFourthLayer[i]=activationPredict(sum,0);
+		zFourthLayer[i] = sum;
 	}
-	cout << "No error till here (4)\n";
 	for(map<string,int>::iterator key=phonemeIDMapping.begin();key!=phonemeIDMapping.end();++key)
 	{
-		cout<<fixed<<setprecision(6)<<"Phoneme: "<<key->first<<" Probability: "<<fourthLayer[key->second]<<endl;
+		cout<<fixed<<setprecision(6)<<"Phoneme: "<<key->first<<" Probability: "<<aFourthLayer[key->second]<<endl;
 	}
 }
 void initPrediction(string filename)
 {
 	ifstream file(filename.c_str());
 	int i=0;
-	cout << "Hi\n";
 	while(file)
 	{
-		cout << i << " ";
-		double positive,negative;
+		float positive,negative;
 		file>>positive>>negative;
-		double val=positive>negative?positive:-negative;
-		inputLayer[i]=normalize(val);
+		float val=positive>negative?positive:-negative;
+		aInputLayer[i]=normalize(val);
 		i++;
 	}
-	cout << "Ohno\n";
 	predict();
 }
 int main()
@@ -455,8 +531,8 @@ int main()
 	initPrediction("Sound/test");
 	cout<<"Prediction phase finished..."<<endl;
 	time_t end=time(NULL);
-	double total_time=abs(difftime(start,end));
-	double avg_time=timeTaken/(double)maxIterations;
+	float total_time=abs(difftime(start,end));
+	float avg_time=timeTaken/(float)maxIterations;
 	cout<<"Total time taken: "<<total_time<<" seconds"<<endl;
 	cout<<"Total iterations: "<<maxIterations<<endl;
 	cout<<"Average time for one iteration: "<<avg_time<<" seconds"<<endl;
